@@ -1,7 +1,7 @@
 /*
 	BurpExtender.java
 	
-	v0.2 (8/31/2017)
+	v0.3 (6/24/2022)
 	
 	Small Burp Suite Extension to generate multiple scan reports by host with just a few clicks. Works with Burp Suite Professional only.
 */
@@ -18,10 +18,12 @@ import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
 import javax.swing.JFileChooser;
 import javax.swing.JButton;
+import javax.swing.JOptionPane;
 import javax.swing.SwingConstants;
 import java.awt.Component;
 import java.awt.GridLayout;
 import java.awt.FlowLayout;
+import java.awt.Color;
 import java.awt.event.ActionListener;
 import java.awt.event.ActionEvent;
 import java.io.File;
@@ -34,23 +36,35 @@ import java.util.Date;
 import java.net.URL;
 import java.text.SimpleDateFormat;
 
-public class BurpExtender implements IBurpExtender,ITab,ActionListener {
+public class BurpExtender implements IBurpExtender,ITab,IExtensionStateListener,ActionListener {
 	private IBurpExtenderCallbacks callbacks;
 	private IExtensionHelpers helpers;
 	private String name;
 	
 	//configuration fields
 	private String reportFormat;
+	private boolean[] severities; //filters for issue severities
+	private boolean[] confidences; //filters for issue confidences
 	private boolean inscopeOnly;
 	private boolean mergeHttps; //merge http:80 and https:443 into one report
 	private boolean mergeAll; //merge all protocols and ports into 1 report
 	private File destDir;
-	private boolean fileDate; //append generation date to filename in format MMDDYYYY
+	private int fileDate; //append generation date to filename (if -1, then do not append; if >-1, append using format from DATE_FORMATS index)
+	private boolean createSubDirectories; //create sub-directory for each report (named after host)
 	
 	//UI fields
 	private JPanel component;
+	private JButton defaultSettingsButton;
 	private JRadioButton htmlButton;
 	private JRadioButton xmlButton;
+	private JCheckBox includeHighSeverityCheck;
+	private JCheckBox includeMediumSeverityCheck;
+	private JCheckBox includeLowSeverityCheck;
+	private JCheckBox includeInformationSeverityCheck;
+	private JCheckBox includeFalsePositiveSeverityCheck;
+	private JCheckBox includeCertainConfidenceCheck;
+	private JCheckBox includeFirmConfidenceCheck;
+	private JCheckBox includeTentativeConfidenceCheck;
 	private JCheckBox inscopeCheck;
 	private JCheckBox httpsCheck;
 	private JCheckBox mergeAllCheck;
@@ -59,12 +73,14 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 	private JLabel destDirLabel;
 	private JCheckBox filenameDateCheck;
 	private JComboBox<String> dateFormatChooser;
+	private JCheckBox createSubDirectoriesCheck;
 	private JButton generateButton;
 	private JLabel statusLabel;
 	
 	//constants
-	private static final String VERSION = "0.2";
-	private static final String[] dateFormats = {"MMddyyyy","ddMMyyyy","yyyyMMdd","MMddyy","ddMMyy","yyMMdd"};
+	private static final String VERSION = "0.3";
+	private static final String[] DATE_FORMATS = {"MMddyyyy","ddMMyyyy","yyyyMMdd","MMddyy","ddMMyy","yyMMdd"};
+	private static final String OPTION_PREFIX = "bort.batchreport";
 	
 	//IBurpExtender methods
 	@Override
@@ -74,15 +90,45 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 		name = "Batch Scan Report Generator";
 		callbacks.setExtensionName(name+" v"+VERSION);
 		
-		//initialized default settings
-		reportFormat = "HTML";
-		inscopeOnly = true;
-		mergeHttps = true;
-		mergeAll = false;
-		destDir = new File(System.getProperty("java.io.tmpdir"));
-		fileDate = false;
+		//initialize default settings, then restore saved settings (if any)
+		setDefaultOptions();
+		String savedOption = callbacks.loadExtensionSetting(OPTION_PREFIX+".reportFormat");
+		if(savedOption != null) reportFormat = savedOption;
+		savedOption = callbacks.loadExtensionSetting(OPTION_PREFIX+".severities");
+		if(savedOption != null) {
+			String[] optionSplit = savedOption.split(",");
+			for(int i=0;i<optionSplit.length;i++) {
+				severities[i] = Boolean.parseBoolean(optionSplit[i]);
+			}
+		}
+		savedOption = callbacks.loadExtensionSetting(OPTION_PREFIX+".confidences");
+		if(savedOption != null) {
+			String[] optionSplit = savedOption.split(",");
+			for(int i=0;i<optionSplit.length;i++) {
+				confidences[i] = Boolean.parseBoolean(optionSplit[i]);
+			}
+		}
+		savedOption = callbacks.loadExtensionSetting(OPTION_PREFIX+".inscopeOnly");
+		if(savedOption != null) inscopeOnly = Boolean.parseBoolean(savedOption);
+		savedOption = callbacks.loadExtensionSetting(OPTION_PREFIX+".mergeHttps");
+		if(savedOption != null) mergeHttps = Boolean.parseBoolean(savedOption);
+		savedOption = callbacks.loadExtensionSetting(OPTION_PREFIX+".mergeAll");
+		if(savedOption != null) mergeAll = Boolean.parseBoolean(savedOption);
+		savedOption = callbacks.loadExtensionSetting(OPTION_PREFIX+".destDir");
+		if(savedOption != null) destDir = new File(savedOption);
+		savedOption = callbacks.loadExtensionSetting(OPTION_PREFIX+".fileDate");
+		if(savedOption != null) {
+			try { //had to put this in here after changing fileDate from boolean to String to int :)
+				fileDate = Integer.parseInt(savedOption);
+			} catch(NumberFormatException nfe) {
+				fileDate = -1;
+			}
+		}
+		savedOption = callbacks.loadExtensionSetting(OPTION_PREFIX+".createSubDirectories");
+		if(savedOption != null) createSubDirectories = Boolean.parseBoolean(savedOption);
 		
 		callbacks.addSuiteTab(this);
+		callbacks.registerExtensionStateListener(this);
 	}
 	
 	
@@ -96,9 +142,13 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 	public Component getUiComponent() {
 		component = new JPanel();
 		
-		JPanel innerPanel = new JPanel(new GridLayout(7,2,2,0));
+		JPanel innerPanel = new JPanel(new GridLayout(11,2,2,0));
+		innerPanel.add(new JLabel());
+		defaultSettingsButton = new JButton("Restore Default Settings");
+		defaultSettingsButton.addActionListener(this);
+		innerPanel.add(defaultSettingsButton);
 		innerPanel.add(new JLabel("Report Output Format:",SwingConstants.RIGHT));
-		htmlButton = new JRadioButton("HTML",true);
+		htmlButton = new JRadioButton("HTML",false);
 		htmlButton.addActionListener(this);
 		htmlButton.setActionCommand("HTML");
 		xmlButton = new JRadioButton("XML",false);
@@ -110,19 +160,58 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 		JPanel buttonPanel = new JPanel(new GridLayout(2,1));
 		buttonPanel.add(htmlButton);
 		buttonPanel.add(xmlButton);
+		if(reportFormat.equalsIgnoreCase("HTML")) {
+			htmlButton.setSelected(true);
+		} else {
+			xmlButton.setSelected(true);
+		}
 		innerPanel.add(buttonPanel);
+		innerPanel.add(new JLabel("Issue Severities To Include:",SwingConstants.RIGHT));
+		JPanel severitiesPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		includeHighSeverityCheck = new JCheckBox((String) "High",severities[0]);
+		includeHighSeverityCheck.addActionListener(this);
+		includeMediumSeverityCheck = new JCheckBox((String) "Medium",severities[1]);
+		includeMediumSeverityCheck.addActionListener(this);
+		includeLowSeverityCheck = new JCheckBox((String) "Low",severities[2]);
+		includeLowSeverityCheck.addActionListener(this);
+		includeInformationSeverityCheck = new JCheckBox((String) "Information",severities[3]);
+		includeInformationSeverityCheck.addActionListener(this);
+		includeFalsePositiveSeverityCheck = new JCheckBox((String) "False positive",severities[4]);
+		includeFalsePositiveSeverityCheck.addActionListener(this);
+		severitiesPanel.add(includeHighSeverityCheck);
+		severitiesPanel.add(includeMediumSeverityCheck);
+		severitiesPanel.add(includeLowSeverityCheck);
+		severitiesPanel.add(includeInformationSeverityCheck);
+		severitiesPanel.add(includeFalsePositiveSeverityCheck);
+		innerPanel.add(severitiesPanel);
+		innerPanel.add(new JLabel("Issue Confidences To Include:",SwingConstants.RIGHT));
+		JPanel confidencesPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+		includeCertainConfidenceCheck = new JCheckBox((String) "Certain",confidences[0]);
+		includeCertainConfidenceCheck.addActionListener(this);
+		includeFirmConfidenceCheck = new JCheckBox((String) "Firm",confidences[1]);
+		includeFirmConfidenceCheck.addActionListener(this);
+		includeTentativeConfidenceCheck = new JCheckBox((String) "Tentative",confidences[2]);
+		includeTentativeConfidenceCheck.addActionListener(this);
+		confidencesPanel.add(includeCertainConfidenceCheck);
+		confidencesPanel.add(includeFirmConfidenceCheck);
+		confidencesPanel.add(includeTentativeConfidenceCheck);
+		innerPanel.add(confidencesPanel);
 		innerPanel.add(new JLabel("Report On In-Scope Sites Only:",SwingConstants.RIGHT));
-		inscopeCheck = new JCheckBox((String) null,true);
+		inscopeCheck = new JCheckBox((String) null,inscopeOnly);
 		inscopeCheck.addActionListener(this);
 		innerPanel.add(inscopeCheck);
 		innerPanel.add(new JLabel("Merge HTTP (port 80) and HTTPS (port 443) For Reports:",SwingConstants.RIGHT));
-		httpsCheck = new JCheckBox((String) null,true);
+		httpsCheck = new JCheckBox((String) null,mergeHttps);
 		httpsCheck.addActionListener(this);
 		innerPanel.add(httpsCheck);
 		innerPanel.add(new JLabel("One Host Per Report (Combine All Protocols and Ports):",SwingConstants.RIGHT));
-		mergeAllCheck = new JCheckBox((String) null,false);
+		mergeAllCheck = new JCheckBox((String) null,mergeAll);
 		mergeAllCheck.addActionListener(this);
 		innerPanel.add(mergeAllCheck);
+		if(mergeAll) {
+			httpsCheck.setSelected(true);
+			httpsCheck.setEnabled(false);
+		}
 		innerPanel.add(new JLabel("Report Output Root Directory:",SwingConstants.RIGHT));
 		destDirChooser = new JFileChooser();
 		destDirChooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
@@ -135,21 +224,31 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 		innerPanel.add(dirPanel);
 		innerPanel.add(new JLabel("Append Date To Report Filenames:",SwingConstants.RIGHT));
 		JPanel datePanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-		filenameDateCheck = new JCheckBox("Date Format:",false);
+		filenameDateCheck = new JCheckBox("Date Format:",true);
 		filenameDateCheck.addActionListener(this);
 		datePanel.add(filenameDateCheck);
 		dateFormatChooser = new JComboBox<String>();
-		for(int i=0;i<dateFormats.length;i++) {
-			dateFormatChooser.addItem(dateFormats[i].toUpperCase());
+		for(int i=0;i<DATE_FORMATS.length;i++) {
+			dateFormatChooser.addItem(DATE_FORMATS[i].toUpperCase());
 		}
-		dateFormatChooser.setEnabled(false);
+		dateFormatChooser.addActionListener(this);
 		datePanel.add(dateFormatChooser);
+		if(fileDate==-1) {
+			filenameDateCheck.setSelected(false);
+			dateFormatChooser.setEnabled(false);
+		} else {
+			dateFormatChooser.setSelectedIndex(fileDate);
+		}
 		innerPanel.add(datePanel);
+		innerPanel.add(new JLabel("Save Reports To Sub-Directories By Host (Named After Host):",SwingConstants.RIGHT));
+		createSubDirectoriesCheck = new JCheckBox((String) null,createSubDirectories);
+		createSubDirectoriesCheck.addActionListener(this);
+		innerPanel.add(createSubDirectoriesCheck);
 		generateButton = new JButton("Generate Report(s)");
 		generateButton.addActionListener(this);
 		innerPanel.add(generateButton);
 		statusLabel = new JLabel();
-		statusLabel.putClientProperty("html.disable", null);
+		statusLabel.setForeground(Color.ORANGE);
 		innerPanel.add(statusLabel);
 		component.add(innerPanel);
 		callbacks.customizeUiComponent(component);
@@ -157,26 +256,67 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 	}
 	
 	
+	//IExtensionStateListener methods
+	@Override
+	public void extensionUnloaded() {
+		callbacks.saveExtensionSetting(OPTION_PREFIX+".reportFormat",reportFormat);
+		String arrOpt = "";
+		for(int i=0;i<severities.length;i++) {
+			arrOpt = arrOpt.concat(Boolean.toString(severities[i])+",");
+		}
+		arrOpt = arrOpt.substring(0,arrOpt.length()-1);
+		callbacks.saveExtensionSetting(OPTION_PREFIX+".severities",arrOpt);
+		arrOpt = "";
+		for(int i=0;i<confidences.length;i++) {
+			arrOpt = arrOpt.concat(Boolean.toString(confidences[i])+",");
+		}
+		arrOpt = arrOpt.substring(0,arrOpt.length()-1);
+		callbacks.saveExtensionSetting(OPTION_PREFIX+".confidences",arrOpt);
+		callbacks.saveExtensionSetting(OPTION_PREFIX+".inscopeOnly",Boolean.toString(inscopeOnly));
+		callbacks.saveExtensionSetting(OPTION_PREFIX+".mergeHttps",Boolean.toString(mergeHttps));
+		callbacks.saveExtensionSetting(OPTION_PREFIX+".mergeAll",Boolean.toString(mergeAll));
+		callbacks.saveExtensionSetting(OPTION_PREFIX+".destDir",destDir.getAbsolutePath());
+		callbacks.saveExtensionSetting(OPTION_PREFIX+".fileDate",Integer.toString(fileDate));
+		callbacks.saveExtensionSetting(OPTION_PREFIX+".createSubDirectories",Boolean.toString(createSubDirectories));
+	}
+	
+	
 	//ActionListener methods
 	@Override
 	public void actionPerformed(ActionEvent ae) {
 		Object source = ae.getSource();
-		if((source == htmlButton) || (source == xmlButton)) {
+		if(source == defaultSettingsButton) {
+			Thread resetterThread = new Thread(new ResetSettingsThread());
+			resetterThread.start();
+		} else if((source == htmlButton) || (source == xmlButton)) {
 			String comStr = ae.getActionCommand();
 			if(comStr.equalsIgnoreCase("HTML")) {
 				reportFormat = "HTML".toUpperCase();
 			} else if(comStr.equalsIgnoreCase("XML")) {
 				reportFormat = "XML".toUpperCase();
 			}
+		} else if(source == includeHighSeverityCheck) {
+			severities[0] = includeHighSeverityCheck.isSelected();
+		} else if(source == includeMediumSeverityCheck) {
+			severities[1] = includeMediumSeverityCheck.isSelected();
+		} else if(source == includeLowSeverityCheck) {
+			severities[2] = includeLowSeverityCheck.isSelected();
+		} else if(source == includeInformationSeverityCheck) {
+			severities[3] = includeInformationSeverityCheck.isSelected();
+		} else if(source == includeFalsePositiveSeverityCheck) {
+			severities[4] = includeFalsePositiveSeverityCheck.isSelected();
+		} else if(source == includeCertainConfidenceCheck) {
+			confidences[0] = includeCertainConfidenceCheck.isSelected();
+		} else if(source == includeFirmConfidenceCheck) {
+			confidences[1] = includeFirmConfidenceCheck.isSelected();
+		} else if(source == includeTentativeConfidenceCheck) {
+			confidences[2] = includeTentativeConfidenceCheck.isSelected();
 		} else if(source == inscopeCheck) {
-			JCheckBox jcb = (JCheckBox) source;
-			inscopeOnly = jcb.isSelected();
+			inscopeOnly = inscopeCheck.isSelected();
 		} else if(source == httpsCheck) {
-			JCheckBox jcb = (JCheckBox) source;
-			mergeHttps = jcb.isSelected();
+			mergeHttps = httpsCheck.isSelected();
 		} else if(source == mergeAllCheck) {
-			JCheckBox jcb = (JCheckBox) source;
-			mergeAll = jcb.isSelected();
+			mergeAll = mergeAllCheck.isSelected();
 			if(mergeAll) {
 				httpsCheck.setSelected(true);
 				httpsCheck.setEnabled(false);
@@ -191,9 +331,17 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 				destDirLabel.setText(destDir.getAbsolutePath());
 			}
 		} else if(source == filenameDateCheck) {
-			JCheckBox jcb = (JCheckBox) source;
-			fileDate = jcb.isSelected();
-			dateFormatChooser.setEnabled(fileDate);
+			if(filenameDateCheck.isSelected()) {
+				dateFormatChooser.setEnabled(true);
+				fileDate = dateFormatChooser.getSelectedIndex();
+			} else {
+				dateFormatChooser.setEnabled(false);
+				fileDate = -1;
+			}
+		} else if(source == dateFormatChooser) {
+			fileDate = dateFormatChooser.getSelectedIndex();
+		} else if(source == createSubDirectoriesCheck) {
+			createSubDirectories = createSubDirectoriesCheck.isSelected();
 		} else if(source == generateButton) {
 			Thread genThread = new Thread(new GenerateThread());
 			genThread.start();
@@ -201,23 +349,45 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 	}
 	
 	
+	private void setDefaultOptions() {
+		reportFormat = "HTML";
+		severities = new boolean[] {true,true,true,true,false};
+		confidences = new boolean[] {true,true,true};
+		inscopeOnly = true;
+		mergeHttps = true;
+		mergeAll = false;
+		destDir = new File(System.getProperty("java.io.tmpdir"));
+		fileDate = -1;
+		createSubDirectories = false;
+	}
+	
+	
 	//private "Report Generation Thread" class
 	private class GenerateThread implements Runnable {
+		@Override
 		public void run() {
 			generateButton.setText("Generating Report(s), Please Wait...");
 			generateButton.setEnabled(false);
+			defaultSettingsButton.setEnabled(false);
 			htmlButton.setEnabled(false);
 			xmlButton.setEnabled(false);
+			includeHighSeverityCheck.setEnabled(false);
+			includeMediumSeverityCheck.setEnabled(false);
+			includeLowSeverityCheck.setEnabled(false);
+			includeInformationSeverityCheck.setEnabled(false);
+			includeFalsePositiveSeverityCheck.setEnabled(false);
+			includeCertainConfidenceCheck.setEnabled(false);
+			includeFirmConfidenceCheck.setEnabled(false);
+			includeTentativeConfidenceCheck.setEnabled(false);
 			inscopeCheck.setEnabled(false);
 			httpsCheck.setEnabled(false);
-			boolean mergeAllSet = mergeAll;
 			mergeAllCheck.setEnabled(false);
 			destDirButton.setEnabled(false);
-			boolean dateCheckSet = fileDate;
 			filenameDateCheck.setEnabled(false);
 			dateFormatChooser.setEnabled(false);
+			createSubDirectoriesCheck.setEnabled(false);
 			callbacks.printOutput("Reading Full List of Issues");
-			statusLabel.setText("<html><font color=\'orange\'>Reading Full List of Issues...</font></html>");
+			statusLabel.setText("Reading Full List of Issues...");
 			
 			IScanIssue[] issueListFull = callbacks.getScanIssues(null);
 			if(issueListFull==null) issueListFull = new IScanIssue[0]; //if extension is loaded into Burp Suite Free: avoid NullPointerException here
@@ -257,33 +427,18 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 			if(!siteKeys.isEmpty()) {
 				if(!destDir.exists()) { //if chosen output folder does not exist, create it
 					if(!destDir.mkdirs()) {
-						callbacks.printError(destDir.getAbsolutePath()+" could not be created!");
-						statusLabel.setText("<html><font color=\'orange\'>"+destDir.getAbsolutePath()+" directory could not be created!</font></html>");
-						
-						generateButton.setEnabled(true);
-						generateButton.setText("Generate Report(s)");
-						htmlButton.setEnabled(true);
-						xmlButton.setEnabled(true);
-						inscopeCheck.setEnabled(true);
-						if(!mergeAllSet) httpsCheck.setEnabled(true);
-						mergeAllCheck.setEnabled(true);
-						destDirButton.setEnabled(true);
-						filenameDateCheck.setEnabled(true);
+						callbacks.printOutput("Target directory"+destDir.getAbsolutePath()+" could not be created! Report generation aborted!\n");
+						callbacks.printError("Target directory"+destDir.getAbsolutePath()+" could not be created! Report generation aborted!");
+						statusLabel.setText("Target directory"+destDir.getAbsolutePath()+" directory could not be created! Report generation aborted!");
+						reEnableUiElements();
 						return;
 					}
 				} else if(!destDir.isDirectory()) { //if chosen output folder is not a directory
-					callbacks.printError(destDir.getAbsolutePath()+" is not a directory!");
-					statusLabel.setText("<html><font color=\'orange\'>"+destDir.getAbsolutePath()+" is not a directory!</font></html>");
-					
-					generateButton.setEnabled(true);
-					generateButton.setText("Generate Report(s)");
-					htmlButton.setEnabled(true);
-					xmlButton.setEnabled(true);
-					inscopeCheck.setEnabled(true);
-					if(!mergeAllSet) httpsCheck.setEnabled(true);
-					mergeAllCheck.setEnabled(true);
-					destDirButton.setEnabled(true);
-					filenameDateCheck.setEnabled(true);
+					callbacks.printOutput("Target "+destDir.getAbsolutePath()+" is not a directory! Report generation aborted!\n");
+					callbacks.printError("Target "+destDir.getAbsolutePath()+" is not a directory! Report generation aborted!");
+					statusLabel.setText("Target "+destDir.getAbsolutePath()+" is not a directory! Report generation aborted!");
+					reEnableUiElements();
+					return;
 				}
 				
 				Hashtable<String,ArrayList<String>> reportList = new Hashtable<String,ArrayList<String>>();
@@ -356,6 +511,22 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 					}
 				}
 				
+				//Determine if issues should be filtered by severity and/or confidence
+				boolean sevFilter = false;
+				boolean conFilter = false;
+				for(int k=0;k<severities.length;k++) {
+					if(severities[k]!=true) {
+						sevFilter = true;
+						break;
+					}
+				}
+				for(int k=0;k<confidences.length;k++) {
+					if(confidences[k]!=true) {
+						conFilter = true;
+						break;
+					}
+				}
+				
 				Set<String> reportSites = reportList.keySet();
 				Hashtable<String,IScanIssue[]> reportIssues = new Hashtable<String,IScanIssue[]>();
 				Iterator<String> reportIssuesItr = reportSites.iterator();
@@ -367,6 +538,31 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 					while(prefixListItr.hasNext()) {
 						IScanIssue[] issueTempList = callbacks.getScanIssues(prefixListItr.next());
 						for(int k=0;k<issueTempList.length;k++) {
+							//filter issues by severity and/or confidence (if applicable)
+							if(sevFilter) {
+								String severity = issueTempList[k].getSeverity();
+								if(severity.equalsIgnoreCase("High")) {
+									if(severities[0]!=true) continue;
+								} else if(severity.equalsIgnoreCase("Medium")) {
+									if(severities[1]!=true) continue;
+								} else if(severity.equalsIgnoreCase("Low")) {
+									if(severities[2]!=true) continue;
+								} else if(severity.equalsIgnoreCase("Information")) {
+									if(severities[3]!=true) continue;
+								} else if(severity.equalsIgnoreCase("False Positive")) {
+									if(severities[4]!=true) continue;
+								}
+							}
+							if(conFilter) {
+								String confidence = issueTempList[k].getConfidence();
+								if(confidence.equalsIgnoreCase("Certain")) {
+									if(confidences[0]!=true) continue;
+								} else if(confidence.equalsIgnoreCase("Firm")) {
+									if(confidences[1]!=true) continue;
+								} else if(confidence.equalsIgnoreCase("Tentative")) {
+									if(confidences[2]!=true) continue;
+								}
+							}
 							issueList.add(issueTempList[k]);
 						}
 					}
@@ -378,42 +574,120 @@ public class BurpExtender implements IBurpExtender,ITab,ActionListener {
 				}
 				
 				Set<String> reportFilenames = reportIssues.keySet();
+				if(reportFilenames.size()==0) {
+					callbacks.printOutput("No reports generated: Sites matching requirements contained no issues to report!\n");
+					callbacks.printError("No reports generated: Sites matching requirements contained no issues to report!\n");
+					statusLabel.setText("No reports generated: Sites matching requirements contained no issues to report!");
+					reEnableUiElements();
+					return;
+				}
 				callbacks.printOutput("Starting report generation of "+Integer.toString(reportFilenames.size())+" reports");
-				statusLabel.setText("<html><font color=\'orange\'>Starting report generation of "+Integer.toString(reportFilenames.size())+" reports...</font></html>");
+				statusLabel.setText("Starting report generation of "+Integer.toString(reportFilenames.size())+" reports...");
 				Iterator<String> reportFilenamesItr = reportFilenames.iterator();
 				int count = 1;
 				while(reportFilenamesItr.hasNext()) {
 					String filename = reportFilenamesItr.next();
-					statusLabel.setText("<html><font color=\'orange\'>Generating report "+Integer.toString(count)+" of "+Integer.toString(reportFilenames.size())+"...</font></html>");
+					callbacks.printOutput("Generating report "+Integer.toString(count)+" of "+Integer.toString(reportFilenames.size()));
+					statusLabel.setText("Generating report "+Integer.toString(count)+" of "+Integer.toString(reportFilenames.size())+"...");
 					IScanIssue[] issueList = reportIssues.get(filename);
-					if(fileDate) {
+					if(fileDate>-1) {
 						filename = filename.substring(0,filename.length()-(reportFormat.toLowerCase().length()+1))+"-";
-						SimpleDateFormat sdf = new SimpleDateFormat(dateFormats[dateFormatChooser.getSelectedIndex()]);
+						SimpleDateFormat sdf = new SimpleDateFormat(DATE_FORMATS[fileDate]);
 						filename += sdf.format(new Date())+"."+reportFormat.toLowerCase();
 					}
-					File reportFile = new File(destDir,filename);
+					File reportFile = null;
+					if(createSubDirectories) {
+						File subDirFile = new File(destDir,issueList[0].getHttpService().getHost());
+						if(!subDirFile.exists()) { //if chosen output folder does not exist, create it
+							if(!subDirFile.mkdirs()) {
+								callbacks.printOutput("Host sub-directory "+subDirFile.getAbsolutePath()+" could not be created! Report generation aborted!\n");
+								callbacks.printError("Host sub-directory "+subDirFile.getAbsolutePath()+" could not be created! Report generation aborted!");
+								statusLabel.setText(subDirFile.getAbsolutePath()+" directory could not be created! Report generation aborted!");
+								reEnableUiElements();
+								return;
+							}
+						} else if(!destDir.isDirectory()) { //if chosen output folder is not a directory
+							callbacks.printOutput(destDir.getAbsolutePath()+" is not a directory! Report generation aborted!\n");
+							callbacks.printError(destDir.getAbsolutePath()+" is not a directory! Report generation aborted!");
+							statusLabel.setText(destDir.getAbsolutePath()+" is not a directory! Report generation aborted!");
+							reEnableUiElements();
+							return;
+						}
+						reportFile = new File(subDirFile,filename);
+					} else {
+						reportFile = new File(destDir,filename);
+					}
 					callbacks.generateScanReport(reportFormat.toUpperCase(),issueList,reportFile);
 					callbacks.printOutput("Report "+Integer.toString(count)+" ("+reportFile.getAbsolutePath()+") of "+Integer.toString(reportFilenames.size())+" generated successfully!");
+					statusLabel.setText("Generating report "+Integer.toString(count)+" of "+Integer.toString(reportFilenames.size())+"...");
 					count++;
 				}
-				callbacks.printOutput("Report Generation Complete!");
-				statusLabel.setText("<html><font color=\'orange\'>Report Generation Complete!</font></html>");
+				callbacks.printOutput("Report Generation Complete!\n");
+				statusLabel.setText("Report Generation Complete!");
 				
 			} else {
-				callbacks.printError("No reports generated: No sites match requirements for report generation!");
-				statusLabel.setText("<html><font color=\'orange\'>No reports generated: No sites match requirements for report generation!</font></html>");
+				callbacks.printOutput("No reports generated: No sites match requirements for report generation!\n");
+				callbacks.printError("No reports generated: No sites match requirements for report generation!\n");
+				statusLabel.setText("No reports generated: No sites match requirements for report generation!");
 			}
 			
+			reEnableUiElements();
+			return;
+		}
+		
+		private void reEnableUiElements() {
 			generateButton.setEnabled(true);
 			generateButton.setText("Generate Report(s)");
+			defaultSettingsButton.setEnabled(true);
 			htmlButton.setEnabled(true);
 			xmlButton.setEnabled(true);
+			includeHighSeverityCheck.setEnabled(true);
+			includeMediumSeverityCheck.setEnabled(true);
+			includeLowSeverityCheck.setEnabled(true);
+			includeInformationSeverityCheck.setEnabled(true);
+			includeFalsePositiveSeverityCheck.setEnabled(true);
+			includeCertainConfidenceCheck.setEnabled(true);
+			includeFirmConfidenceCheck.setEnabled(true);
+			includeTentativeConfidenceCheck.setEnabled(true);
 			inscopeCheck.setEnabled(true);
-			if(!mergeAllSet) httpsCheck.setEnabled(true);
+			httpsCheck.setEnabled(!mergeAll);
 			mergeAllCheck.setEnabled(true);
 			destDirButton.setEnabled(true);
 			filenameDateCheck.setEnabled(true);
-			dateFormatChooser.setEnabled(dateCheckSet);
+			if(fileDate>-1) dateFormatChooser.setEnabled(true);
+			createSubDirectoriesCheck.setEnabled(true);
+			return;
+		}
+	}
+	
+	
+	//private "Default Settings Resetter" class
+	private class ResetSettingsThread implements Runnable {
+		@Override
+		public void run() {
+			int result = JOptionPane.showConfirmDialog(null,"Restore Batch Report Generation Settings to Defaults?","Restore Default Settings",JOptionPane.YES_NO_OPTION,JOptionPane.WARNING_MESSAGE);
+			if(result == JOptionPane.YES_OPTION) {
+				setDefaultOptions();
+				htmlButton.setSelected(true);
+				xmlButton.setSelected(false);
+				includeHighSeverityCheck.setSelected(true);
+				includeMediumSeverityCheck.setSelected(true);
+				includeLowSeverityCheck.setSelected(true);
+				includeInformationSeverityCheck.setSelected(true);
+				includeFalsePositiveSeverityCheck.setSelected(false);
+				includeCertainConfidenceCheck.setSelected(true);
+				includeFirmConfidenceCheck.setSelected(true);
+				includeTentativeConfidenceCheck.setSelected(true);
+				inscopeCheck.setSelected(true);
+				httpsCheck.setSelected(true);
+				httpsCheck.setEnabled(true);
+				mergeAllCheck.setSelected(false);
+				destDirLabel.setText(destDir.getAbsolutePath());
+				filenameDateCheck.setSelected(false);
+				dateFormatChooser.setSelectedIndex(0);
+				createSubDirectoriesCheck.setSelected(false);
+				callbacks.printOutput("Default settings restored.");
+			}
 		}
 	}
 }
